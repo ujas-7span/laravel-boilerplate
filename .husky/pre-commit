@@ -1,0 +1,21 @@
+#!/bin/sh
+
+echo "Running Pint..."
+./vendor/bin/pint
+
+echo "Auto-exporting OpenAPI & TypeScript types..."
+npm run types
+
+echo "Re-staging fixes & generated types..."
+git add -u
+
+echo "Running Arch tests..."
+php -d memory_limit=512M ./vendor/bin/pest tests/Arch.php --no-coverage || exit 1
+
+echo "Running Test Suite..."
+php -d memory_limit=512M ./vendor/bin/pest --no-coverage || exit 1
+
+echo "Running PHPStan..."
+./vendor/bin/phpstan --memory-limit=2G analyse || exit 1
+
+echo "Pre-commit checks passed!"
