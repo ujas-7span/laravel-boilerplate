@@ -2,16 +2,33 @@
 
 namespace App\Queries\Concerns;
 
+use Throwable;
+use Carbon\Carbon;
 use Illuminate\Support\Str;
 use Illuminate\Database\Eloquent\Builder;
 
 /**
- * Handles dynamic filtering, date-range filtering, type-casting, and multi-column searching.
+ * Handles dynamic filtering, date-range filtering, strict type-casting coercion, and multi-column searching.
  */
 trait FiltersQueries
 {
     /**
-     * Apply allowed filters.
+     * Sentinel value indicating a filter failed type coercion.
+     */
+    protected const FILTER_INVALID = '__QUERY_FILTER_INVALID__';
+
+    /**
+     * Force the query to return zero rows.
+     */
+    public function forceEmptyResult(): static
+    {
+        $this->query->whereRaw('0 = 1');
+
+        return $this;
+    }
+
+    /**
+     * Apply allowed filters with strict type coercion and invalid input protection.
      */
     protected function applyFilters(): static
     {
@@ -41,27 +58,42 @@ trait FiltersQueries
             }
 
             $column = $field;
+            $operator = '=';
 
             if (str_ends_with($field, '_after') || str_ends_with($field, '_from')) {
                 $column = (string) preg_replace('/_(after|from)$/', '', $field);
-                $this->query->where($column, '>=', $value);
-
-                continue;
-            }
-
-            if (str_ends_with($field, '_before') || str_ends_with($field, '_to')) {
+                $operator = '>=';
+            } elseif (str_ends_with($field, '_before') || str_ends_with($field, '_to')) {
                 $column = (string) preg_replace('/_(before|to)$/', '', $field);
-                $this->query->where($column, '<=', $value);
-
-                continue;
+                $operator = '<=';
             }
 
             $castValue = $this->castFilterValue($column, $value);
 
+            if ($castValue === self::FILTER_INVALID) {
+                $this->forceEmptyResult();
+
+                return $this;
+            }
+
             if (is_array($castValue)) {
-                $this->query->whereIn($column, $castValue);
+                if (in_array(self::FILTER_INVALID, $castValue, true)) {
+                    $this->forceEmptyResult();
+
+                    return $this;
+                }
+
+                if ($operator === '=') {
+                    $this->query->whereIn($column, $castValue);
+                } else {
+                    $this->query->where(function (Builder $sub) use ($column, $operator, $castValue): void {
+                        foreach ($castValue as $val) {
+                            $sub->orWhere($column, $operator, $val);
+                        }
+                    });
+                }
             } else {
-                $this->query->where($column, $castValue);
+                $this->query->where($column, $operator, $castValue);
             }
         }
 
@@ -70,6 +102,7 @@ trait FiltersQueries
 
     /**
      * Cast filter string value to appropriate type based on model $casts.
+     * Returns FILTER_INVALID if the value fails type coercion.
      */
     protected function castFilterValue(string $column, mixed $value): mixed
     {
@@ -79,8 +112,9 @@ trait FiltersQueries
 
         $model = $this->query->getModel();
         $casts = $model->getCasts();
-        $castType = $casts[$column] ?? null;
+        $castType = strtolower((string) ($casts[$column] ?? ''));
 
+        // Handle boolean casts
         if ($castType === 'boolean' || $castType === 'bool') {
             if ($value === 'true' || $value === '1' || $value === 1 || $value === true) {
                 return true;
@@ -88,6 +122,49 @@ trait FiltersQueries
             if ($value === 'false' || $value === '0' || $value === 0 || $value === false) {
                 return false;
             }
+
+            return self::FILTER_INVALID;
+        }
+
+        // Handle integer & timestamp casts
+        if ($castType === 'int' || $castType === 'integer' || $castType === 'timestamp') {
+            if (is_int($value)) {
+                return $value;
+            }
+            if (is_string($value) && filter_var($value, FILTER_VALIDATE_INT) !== false) {
+                return (int) $value;
+            }
+
+            return self::FILTER_INVALID;
+        }
+
+        // Handle float / decimal casts
+        if ($castType === 'real' || $castType === 'float' || $castType === 'double' || str_starts_with($castType, 'decimal')) {
+            if (is_numeric($value)) {
+                return (float) $value;
+            }
+
+            return self::FILTER_INVALID;
+        }
+
+        // Handle date / datetime casts or date-named columns (_at, _date, timestamps)
+        $isDateColumn = str_starts_with($castType, 'date')
+            || str_starts_with($castType, 'immutable_date')
+            || str_starts_with($castType, 'custom_datetime')
+            || str_ends_with($column, '_at')
+            || str_ends_with($column, '_date')
+            || in_array($column, ['created_at', 'updated_at', 'deleted_at'], true);
+
+        if ($isDateColumn) {
+            if (is_string($value) || is_numeric($value)) {
+                try {
+                    return Carbon::parse($value)->toDateTimeString();
+                } catch (Throwable) {
+                    return self::FILTER_INVALID;
+                }
+            }
+
+            return self::FILTER_INVALID;
         }
 
         return $value;
